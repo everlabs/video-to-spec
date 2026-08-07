@@ -4,6 +4,21 @@ An [Agent Skill](https://agentskills.io) that turns a screen-recording walkthrou
 
 Works with any AI agent that supports the SKILL.md standard: Claude Code, Codex, Cursor, OpenCode, Gemini CLI, and others.
 
+<table>
+  <tr>
+    <th>How it works</th>
+    <th>What you get</th>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="https://raw.githubusercontent.com/everlabs/public-skills/main/assets/video-to-spec-scheme.svg" alt="How the skill works: a screen recording is split into deduplicated frames and a transcript, merged into a timeline, mined for tasks, and written out as a numbered spec folder.">
+    </td>
+    <td width="50%" valign="top">
+      <img src="https://raw.githubusercontent.com/everlabs/public-skills/main/assets/video-to-spec-example.svg" alt="A single spec file produced by the skill: task title, type and source timestamps, user story, the quoted remark it came from, and a wireframe of the screen it refers to.">
+    </td>
+  </tr>
+</table>
+
 ```
 recording.mp4 (+ optional captions)
         │
