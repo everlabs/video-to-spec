@@ -67,7 +67,9 @@ docs/video-to-spec/<spec>/_work/
 
 ## Workflow
 
-Run these steps in order. Use TodoWrite to track them as a checklist while you work.
+Run these steps in order. Track them as a checklist while you work (use your todo/task-tracking tool if you have one).
+
+Paths like `scripts/transcribe.py` below are relative to this skill's folder – the directory containing this SKILL.md, wherever your agent installed it.
 
 ### 1. Resolve inputs
 
@@ -110,7 +112,7 @@ Found captions → use them and **skip the rest of this step** (no transcription
 **b. No captions → transcribe.** First detect what is available:
 
 ```bash
-python3 ~/.claude/skills/video-to-spec/scripts/transcribe.py --detect
+python3 scripts/transcribe.py --detect
 ```
 
 Providers, in preference order (local first – free and private):
@@ -123,11 +125,11 @@ Providers, in preference order (local first – free and private):
 | `command` | any user tool | – | `--command 'mytool {audio} -o {srt}'`; placeholders `{video}` `{audio}` `{srt}` |
 
 - **Something available** → tell the user what was detected and which provider you will use. For `openai-api`, state the approximate cost (video duration × $0.006/min) and **confirm before calling** – it is a paid external API.
-- **Nothing available** → ask the user (AskUserQuestion) to choose: install `mlx-whisper` (Apple Silicon) or `openai-whisper` (any platform), provide an OpenAI API key, supply a custom command template for their own tool, or provide a captions file themselves. Do not auto-install.
+- **Nothing available** → ask the user to choose (via a structured question tool like AskUserQuestion if available, otherwise in chat): install `mlx-whisper` (Apple Silicon) or `openai-whisper` (any platform), provide an OpenAI API key, supply a custom command template for their own tool, or provide a captions file themselves. Do not auto-install.
 
 Then generate:
 ```bash
-python3 ~/.claude/skills/video-to-spec/scripts/transcribe.py "<video>" \
+python3 scripts/transcribe.py "<video>" \
     --srt-out "docs/video-to-spec/<spec>/transcript.srt" \
     [--provider P] [--language xx]
 ```
@@ -138,7 +140,7 @@ Pass `--language` only if the user named the spoken language; otherwise let the 
 
 Run the helper script:
 ```bash
-python3 ~/.claude/skills/video-to-spec/scripts/process_inputs.py \
+python3 scripts/process_inputs.py \
     "<video>" "<srt>" "docs/video-to-spec/<spec>"
 ```
 
@@ -152,7 +154,7 @@ This:
 
 ### 5. Read the timeline
 
-Read `_work/timeline.md` in full. Use the Read tool on individual frames from `_work/frames-all/` whenever a segment is ambiguous from text alone – the screenshot is the source of truth for what the user was looking at when they spoke.
+Read `_work/timeline.md` in full. View individual frames from `_work/frames-all/` (read the image files) whenever a segment is ambiguous from text alone – the screenshot is the source of truth for what the user was looking at when they spoke.
 
 ### 6. Extract tasks from the timeline
 
@@ -236,7 +238,7 @@ Tasks extracted: <N>
 
 ### 9. Present clarifications as one batch
 
-After everything is drafted, present a single list of clarifying questions covering anything that was ambiguous, contradictory, or where the indirect-requirement reading went beyond what the user explicitly said. Use the AskUserQuestion tool with multiSelect where appropriate.
+After everything is drafted, present a single list of clarifying questions covering anything that was ambiguous, contradictory, or where the indirect-requirement reading went beyond what the user explicitly said. Use a structured question tool (e.g. AskUserQuestion, with multiSelect where appropriate) if available, otherwise ask in chat.
 
 Update affected task files based on the answers.
 

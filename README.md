@@ -1,6 +1,8 @@
 # video-to-spec
 
-A [Claude Code](https://claude.com/claude-code) skill that turns a screen-recording walkthrough (Loom, QuickTime, anything ffmpeg reads) into a folder of reviewable, self-contained user-story specifications – each task with the exact screenshots the speaker was looking at when they said it.
+An [Agent Skill](https://agentskills.io) that turns a screen-recording walkthrough (Loom, QuickTime, anything ffmpeg reads) into a folder of reviewable, self-contained user-story specifications – each task with the exact screenshots the speaker was looking at when they said it.
+
+Works with any AI agent that supports the SKILL.md standard: Claude Code, Codex, Cursor, OpenCode, Gemini CLI, and others.
 
 ```
 recording.mp4 (+ optional captions)
@@ -35,12 +37,17 @@ The extraction is opinionated about how people actually talk in walkthroughs:
 
 ## Install
 
+Just feed this skill to your AI agent: copy the `video-to-spec` folder into your agent's skills directory.
+
 ```bash
 git clone <this-repo>
-cp -R public-skills/video-to-spec ~/.claude/skills/
+cp -R public-skills/video-to-spec ~/.claude/skills/    # Claude Code
+cp -R public-skills/video-to-spec ~/.codex/skills/     # Codex
 ```
 
-Then in Claude Code, say things like *"video to spec"*, *"process my loom feedback"*, *"turn this walkthrough into tasks"*, and point it at a video.
+(Cursor, OpenCode, Gemini CLI, etc. – same folder, your agent's skills path. Or simply tell your agent to install it from this repo.)
+
+Then say things like *"video to spec"*, *"process my loom feedback"*, *"turn this walkthrough into tasks"*, and point your agent at a video.
 
 ## Requirements
 
