@@ -6,14 +6,30 @@ Usage:
     process_inputs.py <video> <srt> <output-dir> [--threshold N] [--backend B]
 
 Backends (auto-detected, in preference order):
+    pixel         mean absolute pixel difference on 64x64 grayscale
+                  thumbnails that ffmpeg produces in one extra pass.
+                  No dependencies beyond ffmpeg; compares in milliseconds.
     imagemagick   `magick compare -metric PHASH` (ImageMagick 7)
     imagemagick6  `compare -metric PHASH`        (ImageMagick 6 legacy)
     imagehash     Python `imagehash` + `Pillow`
 
+`pixel` is the default because the perceptual backends are wrong for this job
+in two ways. Correctness: PHASH is *designed* to be robust to small visual
+changes, but on a screen recording the changes that matter - a modal opening,
+a field filling in, an error appearing - are perceptually small and
+semantically large, so a threshold loose enough to ignore cursor drift also
+ignores them (observed: a 6.5-minute portrait recording collapsing to a single
+frame). Speed: both ImageMagick backends spawn one `compare` process per frame
+pair, which costs minutes on a recording of any length.
+
 Per-backend default thresholds (tuned for screen recordings: ignore mouse-
 cursor drift, catch real UI changes like modals, scrolls, form input):
+    pixel                       → 0.1 (percent of pixels changed)
     imagemagick / imagemagick6  → 200
     imagehash                   → 5 (hamming distance out of 64)
+
+Raise --threshold if near-identical frames survive; lower it if real screen
+states are being merged away.
 
 Produces (under <output-dir>/_work/):
     frames-all/HH-MM-SS.png   one image per unique screen state
@@ -34,10 +50,23 @@ from pathlib import Path
 
 
 DEFAULT_THRESHOLDS = {
+    "pixel": 0.1,
     "imagemagick": 200.0,
     "imagemagick6": 200.0,
     "imagehash": 5.0,
 }
+
+# `pixel` backend tuning, measured on a synthetic 8-screen portrait screencast
+# (40 frames, cursor drift within each screen), clean and with heavy encode
+# noise. At 128x128 / delta 32 the smallest *real* change (a form field filling
+# in, a validation line appearing, a status dot) moved 0.22% of pixels while
+# the loudest cursor drift moved 0.067% - a 3.3x margin that did not shift when
+# the same content was re-encoded at 30fps with added sensor noise, because the
+# downscale averages pixel noise away. The default threshold sits between them.
+SIG_EDGE = 128
+# A pixel counts as changed only past this 0-255 delta, which ignores
+# antialiasing and compression ringing while catching real repaints.
+PIXEL_DELTA = 32
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -55,9 +84,12 @@ def detect_backend(preferred: str | None = None) -> tuple[str, list[str] | None]
     if preferred:
         candidates = [preferred]
     else:
-        candidates = ["imagemagick", "imagemagick6", "imagehash"]
+        candidates = ["pixel", "imagemagick", "imagemagick6", "imagehash"]
 
     for c in candidates:
+        if c == "pixel":
+            # ffmpeg is already a hard requirement, so this always works.
+            return ("pixel", None)
         if c == "imagemagick" and shutil.which("magick"):
             return ("imagemagick", ["magick", "compare", "-metric", "PHASH"])
         if c == "imagemagick6" and shutil.which("compare"):
@@ -107,6 +139,68 @@ def extract_frames(video: Path, raw_dir: Path) -> list[Path]:
     ]
     subprocess.run(cmd, check=True)
     return sorted(raw_dir.glob("frame_*.png"))
+
+
+def extract_signatures(video: Path, work_dir: Path) -> list[bytes]:
+    """One extra ffmpeg pass emitting a 64x64 grayscale thumbnail per second.
+
+    Written as a single raw stream so the whole recording costs one subprocess
+    and SIG_EDGE**2 bytes per frame, rather than a process per comparison.
+    """
+    raw = work_dir / "signatures.gray"
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(video),
+        "-vf", f"fps=1,scale={SIG_EDGE}:{SIG_EDGE},format=gray",
+        "-f", "rawvideo", "-pix_fmt", "gray", str(raw),
+    ]
+    subprocess.run(cmd, check=True)
+    blob = raw.read_bytes()
+    raw.unlink(missing_ok=True)
+    size = SIG_EDGE * SIG_EDGE
+    return [blob[i:i + size] for i in range(0, len(blob) - size + 1, size)]
+
+
+def _changed_fraction(a: bytes, b: bytes) -> float:
+    """Percentage of pixels that changed by more than PIXEL_DELTA.
+
+    Counting *how many* pixels changed beats averaging *how much* they changed:
+    UI edits are localised, so a filled form field alters a small region a lot.
+    A mean over the whole frame dilutes that below the cursor-drift floor,
+    while a changed-pixel count separates them cleanly.
+    """
+    if len(a) != len(b) or not a:
+        return 100.0
+    changed = sum(1 for x, y in zip(a, b) if (x - y if x > y else y - x) > PIXEL_DELTA)
+    return 100.0 * changed / len(a)
+
+
+def dedupe_pixel(
+    frames: list[Path], signatures: list[bytes], threshold: float
+) -> list[tuple[int, Path]]:
+    """Keep a frame when it differs enough from the last *kept* frame.
+
+    Comparing against the last kept frame rather than the previous one means a
+    slow scroll accumulates until it crosses the threshold, instead of every
+    step being individually too small to register.
+    """
+    kept: list[tuple[int, Path]] = []
+    last_sig: bytes | None = None
+    for f in frames:
+        m = re.search(r"frame_(\d+)\.png$", f.name)
+        if not m:
+            continue
+        idx = int(m.group(1)) - 1
+        if idx >= len(signatures):
+            # ffmpeg's two passes disagreed on frame count; keep the frame
+            # rather than silently dropping a screen state.
+            kept.append((idx, f))
+            continue
+        sig = signatures[idx]
+        if last_sig is None or _changed_fraction(last_sig, sig) > threshold:
+            kept.append((idx, f))
+            last_sig = sig
+    return kept
 
 
 def _phash_magick(cmd: list[str], a: Path, b: Path) -> float:
@@ -275,9 +369,9 @@ def main() -> None:
     )
     ap.add_argument(
         "--backend",
-        choices=["imagemagick", "imagemagick6", "imagehash"],
+        choices=["pixel", "imagemagick", "imagemagick6", "imagehash"],
         default=None,
-        help="Force a specific backend (default: auto-detect).",
+        help="Force a specific backend (default: pixel).",
     )
     args = ap.parse_args()
 
@@ -304,11 +398,21 @@ def main() -> None:
     print(f"      → {len(frames)} raw frames", file=sys.stderr)
 
     print(f"[2/4] Deduplicating via {backend}", file=sys.stderr)
-    if backend in ("imagemagick", "imagemagick6"):
+    if backend == "pixel":
+        signatures = extract_signatures(video, work_dir)
+        kept = dedupe_pixel(frames, signatures, threshold)
+    elif backend in ("imagemagick", "imagemagick6"):
         kept = dedupe_magick(frames, magick_cmd, threshold)
     else:
         kept = dedupe_imagehash(frames, threshold)
     print(f"      → {len(kept)} unique screen states", file=sys.stderr)
+    if frames and len(kept) <= 1 < len(frames):
+        print(
+            "      warning: everything collapsed to one screen state - the "
+            f"threshold ({threshold}) is likely too high for this recording. "
+            "Re-run with a lower --threshold.",
+            file=sys.stderr,
+        )
 
     print(f"[3/4] Parsing SRT {srt.name}", file=sys.stderr)
     segments = parse_srt(srt)

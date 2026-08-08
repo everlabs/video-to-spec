@@ -68,22 +68,47 @@ Then say things like *"video to spec"*, *"process my loom feedback"*, *"turn thi
 
 | Dependency | Needed for | Install |
 |---|---|---|
-| ffmpeg | always (frames, audio) | `brew install ffmpeg` |
-| ImageMagick *or* Python `imagehash` | frame dedup (auto-detected) | `brew install imagemagick` |
+| ffmpeg | always (frames, audio, dedup) | `brew install ffmpeg` |
 | a transcription provider | only when the video has no captions | see below |
+
+Frame dedup needs nothing beyond ffmpeg: the default `pixel` backend compares 128×128 grayscale thumbnails and keeps a frame when more than 0.1% of pixels change from the last kept one. ImageMagick PHASH and Python `imagehash` remain selectable with `--backend`, but they are a poor fit for screen recordings – perceptual hashing is built to *ignore* small visual changes, and a modal opening or a form field filling in is exactly that. They are also far slower, spawning a process per frame pair.
 
 If the video comes with an `.srt`/`.vtt` (Loom exports these), no transcription setup is needed at all.
 
 ## Transcription providers
 
-Auto-detected, local tools preferred (free, private). The skill reports what it found and confirms before any paid API call.
+Auto-detected, local tools preferred (free, private, and on Apple Silicon also the fastest). The skill reports what it found and confirms before any paid API call.
 
-| Provider | Needs | Notes |
-|---|---|---|
-| `mlx-whisper` | `pip install mlx-whisper` | Apple Silicon, fast |
-| `openai-whisper` | `pip install openai-whisper` | any platform |
-| `openai-api` | `$OPENAI_API_KEY` (or macOS keychain item `OPENAI_API_KEY`) | ~$0.006/min, long files auto-chunked |
-| `command` | your own tool | `--command 'mytool {audio} -o {srt}'` |
+| Provider | Platform | Needs | Default model | `--quality max` |
+|---|---|---|---|---|
+| `mlx-whisper` | Apple Silicon only | `pip install mlx-whisper` | `mlx-community/whisper-large-v3-turbo` | `mlx-community/whisper-large-v3-mlx` |
+| `openai-whisper` | any | `pip install openai-whisper` | `turbo` | `large-v3` |
+| `openai-api` | any | `$OPENAI_API_KEY` (or macOS keychain item `OPENAI_API_KEY`) | `gpt-4o-transcribe-diarize` | – |
+| `command` | any | your own tool: `--command 'mytool {audio} -o {srt}'` | – | – |
+
+`mlx-whisper` has no wheel for Intel Macs or Linux – use `openai-whisper` there.
+
+Installing into a virtualenv beside the skill keeps a multi-gigabyte ML dependency out of your system Python. The script looks in `<skill>/.venv` (and `<skill>/venv`) as well as on `PATH`, so no activation is needed – but it must be *inside the folder this skill was installed to*, whichever agent that is:
+
+```bash
+cd /path/to/your/skills/video-to-spec     # wherever your agent installed it
+python3 -m venv .venv && .venv/bin/pip install mlx-whisper
+python3 scripts/transcribe.py --detect    # confirms it was found
+```
+
+### Choosing a model
+
+**Local is the recommendation, not the fallback.** On Apple Silicon `large-v3-turbo` transcribes about 10× faster than real time, costs nothing, and never uploads the recording.
+
+`--quality max` (`large-v3`) is a **retry, not an upgrade**. It runs roughly 20× slower for a result that is different rather than reliably better: in side-by-side runs on mixed English/Ukrainian audio, each model won some segments and lost others – `large-v3` handled mid-sentence language switches more often, `turbo` was cleaner on single-language passages. Transcribe fast, skim, and re-run at `max` only if the transcript looks garbled.
+
+**Don't set a language on code-switched recordings.** Forcing one language degrades the other; auto-detection handles mixed audio better than a wrong hint.
+
+### Why not `gpt-transcribe`?
+
+It is OpenAI's most accurate transcription model, and it cannot be used here. This skill pins every transcript cue to a video frame, so segment timestamps are mandatory, and `gpt-transcribe` returns JSON/text with none – the API rejects `response_format=srt` outright. The script fails fast with an explanation rather than silently degrading.
+
+`gpt-4o-transcribe-diarize` is the only current-generation OpenAI model that emits per-segment `start`/`end`, so it is the cloud default: the script requests `diarized_json` and converts it to SRT. It is token-priced, so the per-minute rate depends on the audio – OpenAI's published estimate is ~$0.006/min, while a measured run on mixed English/Ukrainian came out at ~$0.02/min, since Cyrillic costs roughly 3× the output tokens of Latin script. Legacy `whisper-1` remains available via `--provider openai-api --model whisper-1` at a flat $0.006/min, but it renders Ukrainian in visibly Russified spelling – a compatibility fallback, not a recommendation.
 
 ## What review looks like
 

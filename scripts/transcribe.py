@@ -4,19 +4,41 @@
 Providers, auto-detected in preference order (local tools first):
     mlx-whisper     `mlx_whisper` CLI - local, free, fast on Apple Silicon
     openai-whisper  `whisper` CLI - local, free
-    openai-api      OpenAI transcription API (whisper-1, native SRT output).
-                    Key from $OPENAI_API_KEY, else the macOS keychain
-                    (generic password with service name OPENAI_API_KEY).
+    openai-api      OpenAI transcription API. Key from $OPENAI_API_KEY, else
+                    the macOS keychain (generic password with service name
+                    OPENAI_API_KEY).
     command         any user-supplied template, e.g.
                     --provider command --command 'mytool {audio} -o {srt}'
                     Placeholders {video} {audio} {srt} are substituted
                     shell-quoted. If {audio} appears, a 16 kHz mono mp3 is
                     extracted first.
 
+Quality tiers (--quality, per provider):
+    fast (default)  mlx-whisper    mlx-community/whisper-large-v3-turbo
+                    openai-whisper turbo
+                    openai-api     gpt-4o-transcribe-diarize
+    max             mlx-whisper    mlx-community/whisper-large-v3-mlx
+                    openai-whisper large-v3
+                    openai-api     gpt-4o-transcribe-diarize (same; no
+                                   higher-accuracy timestamped model exists)
+`--model` overrides the tier entirely.
+
+This skill needs *timestamps* - every cue is matched to a video frame - which
+constrains the API model choice. Only two OpenAI models emit them:
+    gpt-4o-transcribe-diarize  segment start/end via response_format
+                               diarized_json (converted to SRT here).
+                               Requires chunking_strategy, always.
+    whisper-1                  native SRT, but markedly weaker on non-English
+                               (it Russifies Ukrainian). Legacy fallback only.
+`gpt-transcribe` is OpenAI's most accurate transcription model but returns
+JSON/text with no timestamps at all, so it cannot drive this pipeline; asking
+for it fails fast with an explanation rather than silently degrading.
+
 Usage:
     transcribe.py --detect
-    transcribe.py <video> [--srt-out PATH] [--provider P] [--model M]
-                  [--language xx] [--command TEMPLATE] [--chunk-seconds N]
+    transcribe.py <video> [--srt-out PATH] [--provider P]
+                  [--quality fast|max] [--model M] [--language xx]
+                  [--command TEMPLATE] [--chunk-seconds N]
 
 The API path chunks long audio (default 900 s per chunk, ~3.5 MB at 32 kbps,
 safely under the 25 MB upload limit), transcribes each chunk, offsets the
@@ -27,6 +49,7 @@ renumbered SRT.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -44,6 +67,63 @@ TS_PATTERN = re.compile(
     r"(\d{2,}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*"
     r"(\d{2,}):(\d{2}):(\d{2})[,.](\d{3})"
 )
+
+# Per-provider model for each quality tier. --model overrides both.
+MODELS = {
+    "mlx-whisper": {
+        "fast": "mlx-community/whisper-large-v3-turbo",
+        "max": "mlx-community/whisper-large-v3-mlx",
+    },
+    "openai-whisper": {"fast": "turbo", "max": "large-v3"},
+    # Both tiers are the same model: it is the only current-generation OpenAI
+    # model that returns timestamps at all.
+    "openai-api": {
+        "fast": "gpt-4o-transcribe-diarize",
+        "max": "gpt-4o-transcribe-diarize",
+    },
+}
+
+# API models that cannot drive this pipeline, and why.
+UNTIMESTAMPED_API_MODELS = {
+    "gpt-transcribe": "OpenAI's most accurate transcription model, but it "
+                      "returns plain JSON/text with no segment timestamps",
+    "gpt-4o-transcribe": "returns plain JSON/text with no segment timestamps",
+    "gpt-4o-mini-transcribe": "returns plain JSON/text with no segment "
+                              "timestamps",
+}
+
+# Model names that route to the API rather than a local whisper CLI, so that a
+# bare `--model whisper-1` is not handed to mlx_whisper as a HuggingFace repo.
+API_MODEL_RE = re.compile(r"^(whisper-1|gpt-[\w.-]*transcribe[\w.-]*)$")
+SNAPSHOT_SUFFIX_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def provider_for_model(model: str) -> str | None:
+    """Infer the provider a `--model` belongs to, or None if ambiguous.
+
+    Bare whisper names (`turbo`, `large-v3`) fit either local CLI, so they stay
+    ambiguous and fall through to normal auto-detection.
+    """
+    if API_MODEL_RE.match(model):
+        return "openai-api"
+    if model.startswith("mlx-community/") or model.startswith("mlx_"):
+        return "mlx-whisper"
+    return None
+
+
+def untimestamped_reason(model: str) -> str | None:
+    """Why `model` cannot drive this pipeline, or None if it can.
+
+    Only two OpenAI models emit timestamps: whisper-1 (native SRT) and the
+    diarize family (segment start/end). Everything else is checked against the
+    denylist with any dated snapshot suffix stripped, so pinned names like
+    `gpt-4o-mini-transcribe-2025-06-03` are rejected before the upload rather
+    than by a 400 after it.
+    """
+    if model == "whisper-1" or "-diarize" in model:
+        return None
+    base = SNAPSHOT_SUFFIX_RE.sub("", model)
+    return UNTIMESTAMPED_API_MODELS.get(base)
 
 
 def fail(msg: str, code: int = 1) -> None:
@@ -70,11 +150,66 @@ def openai_key() -> tuple[str, str] | None:
     return None
 
 
+def _runnable(candidate: Path) -> bool:
+    """Is this console script actually executable *and* launchable?
+
+    `shutil.which` implies runnable; a venv path does not. A venv whose
+    interpreter was removed (a pyenv upgrade, a deleted base Python) leaves the
+    entry point executable but its shebang dangling, and subprocess.run would
+    die with a bare FileNotFoundError. Check the shebang so a stale venv is
+    reported as "not found" and detection falls through to the next provider.
+    """
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        return False
+    try:
+        with candidate.open("rb") as fh:
+            if fh.read(2) != b"#!":
+                return True  # binary (e.g. Windows .exe) - nothing to verify
+            interpreter = fh.readline().decode("utf-8", "replace").strip()
+    except OSError:
+        return False
+    if not interpreter:
+        return False
+    # Handle `#!/usr/bin/env python3` as well as a direct interpreter path.
+    parts = interpreter.split()
+    exe = parts[0]
+    if exe.endswith("env") and len(parts) > 1:
+        return shutil.which(parts[1]) is not None
+    return Path(exe).exists()
+
+
+def find_tool(name: str) -> str | None:
+    """Locate a CLI on PATH, or in a virtualenv alongside the skill.
+
+    Installing mlx-whisper into `<skill>/.venv` is the tidiest way to keep a
+    multi-gigabyte ML dependency out of the system Python, but it leaves the
+    CLI off PATH unless the venv is activated. Look there too so the skill
+    works straight after `python3 -m venv .venv && .venv/bin/pip install ...`.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    skill_root = Path(__file__).resolve().parent.parent
+    # POSIX venvs put console scripts in bin/; Windows uses Scripts/ with an
+    # executable suffix.
+    if os.name == "nt":
+        subdirs, suffixes = ("Scripts", "bin"), (".exe", ".bat", "")
+    else:
+        subdirs, suffixes = ("bin",), ("",)
+    for venv in (skill_root / ".venv", skill_root / "venv"):
+        for subdir in subdirs:
+            for suffix in suffixes:
+                candidate = venv / subdir / (name + suffix)
+                if _runnable(candidate):
+                    return str(candidate)
+    return None
+
+
 def detect_providers() -> list[str]:
     available = []
-    if shutil.which("mlx_whisper"):
+    if find_tool("mlx_whisper"):
         available.append("mlx-whisper")
-    if shutil.which("whisper"):
+    if find_tool("whisper"):
         available.append("openai-whisper")
     if openai_key():
         available.append("openai-api")
@@ -83,18 +218,24 @@ def detect_providers() -> list[str]:
 
 def print_detect_report() -> None:
     key = openai_key()
-    rows = [
-        ("mlx-whisper", "available" if shutil.which("mlx_whisper") else "not found"),
-        ("openai-whisper", "available" if shutil.which("whisper") else "not found"),
-        ("openai-api", f"available (key in {key[1]})" if key else "not found"),
-    ]
-    for name, status in rows:
-        print(f"{name}: {status}")
+    for name, tool in (("mlx-whisper", "mlx_whisper"), ("openai-whisper", "whisper")):
+        path = find_tool(tool)
+        if path and not shutil.which(tool):
+            print(f"{name}: available (skill venv: {path})")
+        else:
+            print(f"{name}: {'available' if path else 'not found'}")
+    print(f"openai-api: {f'available (key in {key[1]})' if key else 'not found'}")
     for extra in ("whisper-cli", "whisper-cpp"):
         if shutil.which(extra):
             print(f"note: `{extra}` is on PATH - usable via --provider command")
     usable = detect_providers()
     print(f"usable: {', '.join(usable) if usable else 'none'}")
+    if usable:
+        chosen = usable[0]
+        print(
+            f"default: {chosen} / {MODELS[chosen]['fast']} "
+            f"(--quality max -> {MODELS[chosen]['max']})"
+        )
 
 
 # --- media helpers -----------------------------------------------------------
@@ -212,7 +353,15 @@ def _multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, str]:
 
 
 def _openai_call(audio: Path, key: str, model: str, language: str | None) -> str:
-    fields = {"model": model, "response_format": "srt"}
+    diarize = "-diarize" in model
+    fields = {
+        "model": model,
+        "response_format": "diarized_json" if diarize else "srt",
+    }
+    if diarize:
+        # Rejected outright without this, at any audio length:
+        # "chunking_strategy is required for diarization models".
+        fields["chunking_strategy"] = "auto"
     if language:
         fields["language"] = language
     body, content_type = _multipart(fields, audio)
@@ -229,7 +378,70 @@ def _openai_call(audio: Path, key: str, model: str, language: str | None) -> str
         fail(f"OpenAI API error {e.code}: {detail}")
     except urllib.error.URLError as e:
         fail(f"network error calling OpenAI API: {e.reason}")
+    except OSError as e:
+        # A socket read timeout raises TimeoutError, which is an OSError but
+        # *not* a URLError - without this the caller dies on a raw traceback
+        # and every already-billed chunk is discarded.
+        fail(f"network error calling OpenAI API: {e}")
     return ""  # unreachable
+
+
+def parse_diarized_json(text: str) -> list[tuple[int, int, str]]:
+    """Convert a diarized_json response into (start_ms, end_ms, text) cues.
+
+    Shape (verified against the live API):
+        {"text": ..., "duration": 37.08, "usage": {...},
+         "segments": [{"type": "transcript.text.segment", "id": "seg_0",
+                       "speaker": "A", "text": " ...",
+                       "start": 0.0, "end": 2.15}, ...]}
+    Speaker labels are dropped: these recordings are near-always one narrator,
+    and a "A:" prefix on every cue would just be noise downstream.
+    """
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as e:
+        fail(f"could not parse diarized_json response: {e}")
+        return []  # unreachable; fail() exits
+    if not isinstance(payload, dict):
+        fail(
+            "unexpected diarized_json response: expected a JSON object, got "
+            f"{type(payload).__name__}"
+        )
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        fail("diarized_json response has no `segments` array")
+        return []
+    cues = []
+    dropped = 0
+    for seg in segments:
+        if not isinstance(seg, dict):
+            dropped += 1
+            continue
+        body = (seg.get("text") or "").strip()
+        start, end = seg.get("start"), seg.get("end")
+        if start is None or end is None:
+            # Losing spoken text silently is the one failure this skill cannot
+            # afford - the whole point is that no instruction goes missing.
+            if body:
+                dropped += 1
+            continue
+        if not body:
+            continue
+        try:
+            cues.append((round(float(start) * 1000), round(float(end) * 1000), body))
+        except (TypeError, ValueError):
+            dropped += 1
+    if dropped:
+        print(
+            f"warning: dropped {dropped} segment(s) with missing or unusable "
+            "timestamps - transcript may be incomplete",
+            file=sys.stderr,
+        )
+    # diarized output is per-speaker and not guaranteed chronological, whereas
+    # SRT is ordered by construction. Restore that invariant so downstream
+    # frame-matching sees a monotonic timeline.
+    cues.sort(key=lambda c: (c[0], c[1]))
+    return cues
 
 
 def transcribe_openai_api(
@@ -237,13 +449,15 @@ def transcribe_openai_api(
     language: str | None, chunk_seconds: int, workdir: Path,
 ) -> None:
     resolved = openai_key()
-    if not resolved:
+    if not resolved:  # already checked by preflight(); belt and braces
         fail(
             "no OpenAI key found. Set $OPENAI_API_KEY or add a keychain item:\n"
             '  security add-generic-password -s OPENAI_API_KEY -w "<key>"'
         )
+        return
     key, _source = resolved
-    model = model or "whisper-1"
+    model = model or MODELS["openai-api"]["fast"]
+    diarize = "-diarize" in model
     duration = media_duration(audio)
     if duration <= chunk_seconds:
         chunks = [audio]
@@ -254,8 +468,9 @@ def transcribe_openai_api(
     offset_ms = 0
     for i, chunk in enumerate(chunks, 1):
         print(f"transcribing chunk {i}/{len(chunks)}", file=sys.stderr)
-        srt_text = _openai_call(chunk, key, model, language)
-        cues += [(s + offset_ms, e + offset_ms, t) for s, e, t in parse_srt_ms(srt_text)]
+        raw = _openai_call(chunk, key, model, language)
+        parsed = parse_diarized_json(raw) if diarize else parse_srt_ms(raw)
+        cues += [(s + offset_ms, e + offset_ms, t) for s, e, t in parsed]
         offset_ms += round(media_duration(chunk) * 1000)
     if not cues:
         fail("API returned no transcript cues (silent audio?)")
@@ -278,10 +493,18 @@ def transcribe_mlx(
 ) -> None:
     outdir = workdir / "mlx-out"
     outdir.mkdir(exist_ok=True)
+    tool = find_tool("mlx_whisper")
+    if not tool:
+        fail(
+            "mlx_whisper not found on PATH or in the skill's .venv.\n"
+            "  pip install mlx-whisper        (Apple Silicon)\n"
+            "or install it beside the skill:\n"
+            "  python3 -m venv .venv && .venv/bin/pip install mlx-whisper"
+        )
     cmd = [
-        "mlx_whisper", str(audio),
+        tool, str(audio),
         "--output-dir", str(outdir), "--output-format", "srt",
-        "--model", model or "mlx-community/whisper-large-v3-turbo",
+        "--model", model or MODELS["mlx-whisper"]["fast"],
     ]
     if language:
         cmd += ["--language", language]
@@ -295,10 +518,16 @@ def transcribe_local_whisper(
 ) -> None:
     outdir = workdir / "whisper-out"
     outdir.mkdir(exist_ok=True)
+    tool = find_tool("whisper")
+    if not tool:
+        fail(
+            "whisper not found on PATH or in the skill's .venv.\n"
+            "  pip install openai-whisper     (any platform)"
+        )
     cmd = [
-        "whisper", str(audio),
+        tool, str(audio),
         "--output_dir", str(outdir), "--output_format", "srt",
-        "--model", model or "turbo",
+        "--model", model or MODELS["openai-whisper"]["fast"],
     ]
     if language:
         cmd += ["--language", language]
@@ -323,6 +552,39 @@ def transcribe_command(
 # --- main --------------------------------------------------------------------
 
 
+def preflight(provider: str, model: str | None) -> None:
+    """Reject an unusable provider/model combination before any costly work.
+
+    Runs before audio extraction so a bad `--model` or a missing key does not
+    cost a full ffmpeg transcode of the recording first.
+    """
+    if provider != "openai-api":
+        return
+    if not openai_key():
+        fail(
+            "no OpenAI key found. Set $OPENAI_API_KEY or add a keychain item:\n"
+            '  security add-generic-password -s OPENAI_API_KEY -w "<key>"'
+        )
+    if not model:
+        return
+    reason = untimestamped_reason(model)
+    if reason:
+        fail(
+            f"model `{model}` cannot be used: {reason}.\n"
+            "This skill matches every transcript cue to a video frame, so "
+            "timestamps are mandatory. Use one of:\n"
+            "  gpt-4o-transcribe-diarize  (default; segment timestamps)\n"
+            "  whisper-1                  (legacy; native SRT)\n"
+            "  a local provider           (mlx-whisper / openai-whisper)"
+        )
+    if model != "whisper-1" and "-diarize" not in model:
+        print(
+            f"warning: `{model}` is not a known timestamped model. If the API "
+            "rejects response_format=srt, use gpt-4o-transcribe-diarize.",
+            file=sys.stderr,
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -335,10 +597,14 @@ def main() -> None:
     ap.add_argument("--provider",
                     choices=["mlx-whisper", "openai-whisper", "openai-api", "command"],
                     default=None, help="Force a provider (default: auto-detect)")
+    ap.add_argument("--quality", choices=["fast", "max"], default="fast",
+                    help="Quality tier, resolved per provider (default: fast)")
     ap.add_argument("--model", default=None,
-                    help="Model override (per-provider default otherwise)")
+                    help="Model override (overrides --quality)")
     ap.add_argument("--language", default=None,
-                    help="ISO-639-1 language hint, e.g. en, uk (default: auto)")
+                    help="ISO-639-1 language hint, e.g. en, uk. Leave unset "
+                         "for code-switched audio - a forced language degrades "
+                         "the other one (default: auto)")
     ap.add_argument("--command", default=None,
                     help="Template for --provider command; "
                          "placeholders {video} {audio} {srt}, pre-quoted")
@@ -363,6 +629,16 @@ def main() -> None:
     )
 
     provider = args.provider
+    if provider is None and args.model:
+        # `--model whisper-1` must not be handed to a locally detected
+        # mlx_whisper, which would try to fetch it as a HuggingFace repo.
+        inferred = provider_for_model(args.model)
+        if inferred:
+            provider = inferred
+            print(
+                f"note: --model {args.model} implies --provider {inferred}",
+                file=sys.stderr,
+            )
     if provider is None:
         available = detect_providers()
         if not available:
@@ -377,7 +653,13 @@ def main() -> None:
     if provider == "command" and not args.command:
         fail("--provider command requires --command TEMPLATE")
 
-    print(f"provider: {provider}", file=sys.stderr)
+    model = args.model or (
+        MODELS[provider][args.quality] if provider in MODELS else None
+    )
+    # Validate before extract_audio() so a rejected model or a missing key
+    # costs nothing - a full ffmpeg pass over a long recording is minutes.
+    preflight(provider, model)
+    print(f"provider: {provider}" + (f" / {model}" if model else ""), file=sys.stderr)
     with tempfile.TemporaryDirectory(prefix="video-to-spec-") as td:
         workdir = Path(td)
         if provider == "command":
@@ -389,14 +671,14 @@ def main() -> None:
             audio = extract_audio(media, workdir)
             if provider == "openai-api":
                 transcribe_openai_api(
-                    audio, srt_out, args.model, args.language,
+                    audio, srt_out, model, args.language,
                     args.chunk_seconds, workdir,
                 )
             elif provider == "mlx-whisper":
-                transcribe_mlx(audio, srt_out, args.model, args.language, workdir)
+                transcribe_mlx(audio, srt_out, model, args.language, workdir)
             else:
                 transcribe_local_whisper(
-                    audio, srt_out, args.model, args.language, workdir
+                    audio, srt_out, model, args.language, workdir
                 )
 
     print(f"wrote: {srt_out}", file=sys.stderr)

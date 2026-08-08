@@ -75,28 +75,33 @@ Paths like `scripts/transcribe.py` below are relative to this skill's folder –
 
 Determine `<video>` (ask if not given – see resolution order above) and `<spec>`. Confirm the resolved `<spec>` name and output path back to the user before continuing.
 
+In the same exchange, settle cleanup up front so it does not become a separate round-trip at the end. Report the sizes (`du -sh <video>`) and ask which of these to delete once the specs are ready:
+
+- the intermediate `_work/` folder (extracted frames + timeline – typically tens of MB),
+- the source video (often hundreds of MB),
+- the source captions, if the user supplied them.
+
+Record the answer and apply it in step 10 without asking again. The referenced `frames/`, the task files and a generated `transcript.srt` are always kept. If the user defers ("decide later"), fall back to asking in step 10.
+
 ### 2. Check dependencies
 
-Always needed: `ffmpeg` plus one image-comparison backend (auto-detected, preference order):
+Always needed: `ffmpeg`. The frame-dedup backend is auto-detected (preference order):
 
 | Backend | Detection | Default threshold | Notes |
 |---|---|---|---|
-| ImageMagick 7 | `magick` on PATH | 200 (PHASH metric) | Preferred. Already installed on most dev machines. |
+| `pixel` | always (needs only ffmpeg) | 0.1 (percent of pixels changed) | **Default.** Fast and tuned for screen recordings. |
+| ImageMagick 7 | `magick` on PATH | 200 (PHASH metric) | Opt-in via `--backend imagemagick`. |
 | ImageMagick 6 | `compare` on PATH | 200 (PHASH metric) | Legacy `compare` binary. |
-| Python imagehash | `python3 -c "import imagehash, PIL"` | 5 (hamming, 0–64) | Fallback for systems without ImageMagick. |
+| Python imagehash | `python3 -c "import imagehash, PIL"` | 5 (hamming, 0–64) | Opt-in. |
 
 Run a quick check:
 ```bash
-which ffmpeg && (which magick || which compare || python3 -c "import imagehash, PIL")
+which ffmpeg
 ```
 
-If `ffmpeg` is missing: `brew install ffmpeg` (macOS) / distro package manager.
+If `ffmpeg` is missing: `brew install ffmpeg` (macOS) / distro package manager. Nothing else is required – do not auto-install anything. Transcription dependencies are only checked if step 3 needs them.
 
-If no comparison backend is present, suggest **one** of:
-- `brew install imagemagick` (preferred – general-purpose, no Python pollution)
-- `pip3 install --user imagehash Pillow`
-
-Do not auto-install. Transcription dependencies are only checked if step 3 needs them.
+Prefer the default `pixel` backend. The perceptual backends are kept for comparison but are a poor fit here: PHASH is designed to be *robust* to small visual changes, whereas the changes that matter in a screen recording (a modal opening, a field filling in, a validation error appearing) are perceptually small and semantically large. They are also far slower, spawning one `compare` process per frame pair.
 
 ### 3. Locate or generate the transcript
 
@@ -115,26 +120,43 @@ Found captions → use them and **skip the rest of this step** (no transcription
 python3 scripts/transcribe.py --detect
 ```
 
-Providers, in preference order (local first – free and private):
+Providers, in preference order (local first – free, private, and on Apple Silicon also the fastest):
 
-| Provider | Needs | Default model | Notes |
+| Provider | Needs | `--quality fast` (default) | `--quality max` |
 |---|---|---|---|
-| `mlx-whisper` | `mlx_whisper` on PATH | `mlx-community/whisper-large-v3-turbo` | Apple Silicon, fast |
-| `openai-whisper` | `whisper` on PATH | `turbo` | Any platform |
-| `openai-api` | `$OPENAI_API_KEY` (or macOS keychain item `OPENAI_API_KEY`) | `whisper-1` | Paid ~$0.006/min; audio leaves the machine; long files auto-chunked |
-| `command` | any user tool | – | `--command 'mytool {audio} -o {srt}'`; placeholders `{video}` `{audio}` `{srt}` |
+| `mlx-whisper` | `mlx_whisper` on PATH or in `<skill>/.venv` | `mlx-community/whisper-large-v3-turbo` | `mlx-community/whisper-large-v3-mlx` |
+| `openai-whisper` | `whisper` on PATH or in `<skill>/.venv` | `turbo` | `large-v3` |
+| `openai-api` | `$OPENAI_API_KEY` (or macOS keychain item `OPENAI_API_KEY`) | `gpt-4o-transcribe-diarize` | same – see below |
+| `command` | any user tool | `--command 'mytool {audio} -o {srt}'`; placeholders `{video}` `{audio}` `{srt}` | – |
 
-- **Something available** → tell the user what was detected and which provider you will use. For `openai-api`, state the approximate cost (video duration × $0.006/min) and **confirm before calling** – it is a paid external API.
+- **Something available** → tell the user what was detected and which provider and model you will use. For `openai-api`, state the approximate cost and **confirm before calling** – it is a paid external API that uploads their recording.
 - **Nothing available** → ask the user to choose (via a structured question tool like AskUserQuestion if available, otherwise in chat): install `mlx-whisper` (Apple Silicon) or `openai-whisper` (any platform), provide an OpenAI API key, supply a custom command template for their own tool, or provide a captions file themselves. Do not auto-install.
+
+**Why the cloud option is not OpenAI's best model.** This skill pins every transcript cue to a video frame, so segment timestamps are mandatory. `gpt-transcribe` is OpenAI's most accurate transcription model but returns JSON/text with *no* timestamps – the API rejects `response_format=srt` outright – so it cannot drive this pipeline, and `transcribe.py` fails fast with an explanation if asked for it. `gpt-4o-transcribe-diarize` is the only current-generation OpenAI model that emits per-segment `start`/`end`; the script requests `diarized_json` and converts it to SRT. `whisper-1` still works (`--model whisper-1`) but is markedly weaker on non-English – it renders Ukrainian in visibly Russified spelling – so it is a compatibility fallback, not a recommendation.
+
+Cost: `gpt-4o-transcribe-diarize` is token-priced rather than per-minute, so the rate depends on the audio. OpenAI's published estimate is **~$0.006/min**; a measured run on mixed English/Ukrainian came out at **~$0.02/min**, because Cyrillic costs roughly 3× the output tokens of Latin script. Quote `duration × $0.006` for English-only recordings and `duration × $0.02` for Cyrillic-heavy ones, and say which assumption you used. `whisper-1` is a flat $0.006/min regardless of language.
 
 Then generate:
 ```bash
 python3 scripts/transcribe.py "<video>" \
     --srt-out "docs/video-to-spec/<spec>/transcript.srt" \
-    [--provider P] [--language xx]
+    [--provider P] [--quality max] [--language xx]
 ```
 
-Pass `--language` only if the user named the spoken language; otherwise let the model auto-detect. The generated `transcript.srt` stays in the spec folder as a final artifact (it was expensive to produce); provided captions stay wherever they were.
+**Language.** Pass `--language` only when the user says the recording is entirely one language. Leave it unset for anything code-switched – forcing a language degrades the other one, and Whisper's auto-detection handles mixed audio far better than a wrong hint.
+
+**Quality tier.** Start at the default `fast` tier. `--quality max` is the retry, not the default: on Apple Silicon `large-v3` runs roughly 20× slower than `large-v3-turbo` for a result that is *different* rather than reliably better – in side-by-side runs on mixed English/Ukrainian each model won some segments and lost others, with `large-v3` handling mid-sentence language switches more often and `turbo` winning on clean single-language passages. So: transcribe with `fast`, skim the transcript, and re-run with `--quality max` only if it looks garbled, transliterated, or drifts into the wrong language. Mention the retry option to the user rather than silently spending 20× the time.
+
+When you do retry, write it to a **new file** so the two can be compared – neither model is uniformly better, and overwriting destroys the passages the first run got right:
+
+```bash
+python3 scripts/transcribe.py "<video>" --quality max \
+    --srt-out "docs/video-to-spec/<spec>/transcript-max.srt"
+```
+
+Then diff the two, keep whichever reads correctly (or splice the better segments), save the winner as `transcript.srt`, delete the loser, and **re-run step 4** – `_work/timeline.md` was built from the old transcript and steps 5–7 read only the timeline, so skipping this silently drafts tasks from the text the retry was meant to fix.
+
+The generated `transcript.srt` stays in the spec folder as a final artifact (it was expensive to produce); provided captions stay wherever they were.
 
 ### 4. Build the timeline
 
@@ -146,11 +168,13 @@ python3 scripts/process_inputs.py \
 
 This:
 - Extracts one frame per second with ffmpeg.
-- Deduplicates via the auto-detected backend (ImageMagick PHASH or Python imagehash) – mouse-cursor drift is ignored, real screen changes are kept. Pass `--threshold N` if too many or too few frames survive (see table above for sensible per-backend ranges).
+- Deduplicates via the `pixel` backend by default – a second ffmpeg pass emits 128×128 grayscale thumbnails, and a frame is kept when more than `--threshold` percent of pixels (default `0.1`) differ from the last *kept* frame. Mouse-cursor drift is ignored, real screen changes are kept, and a 6-minute recording deduplicates in about two seconds.
 - Renames kept frames to `HH-MM-SS.png` matching SRT-style timestamps.
 - Parses the SRT into segments.
 - For each segment, attaches the most recent kept frame within `start + 1s` (a frame change inside the spoken second still attaches).
 - Writes `_work/timeline.md` + `_work/frames-all/`.
+
+**Sanity-check the frame count before moving on.** A walkthrough that visits several screens should yield tens of screen states, not one or two. If the script warns that everything collapsed to a single state, or the count looks far too low for the recording's length, the threshold is wrong for this material – re-run with a lower `--threshold` (try `0.05`, then `0.02`). Too many near-identical frames is the opposite signal: raise it. Do not proceed to step 5 on a timeline where every segment points at the same frame; the tasks would all cite one screenshot.
 
 ### 5. Read the timeline
 
@@ -244,11 +268,15 @@ Update affected task files based on the answers.
 
 ### 10. Offer cleanup
 
-Once the user is satisfied, ask:
+Apply the cleanup decision taken in step 1. State what you are deleting and do it – do not re-ask a question the user already answered:
 
-> "Source files no longer needed. Delete `<video>`, the source captions (if any), and `<output>/_work/` (intermediate frames + timeline)?"
+> "Deleting as agreed: `<output>/_work/` (31 MB) and `<video>` (233 MB). The 9 referenced frames and `transcript.srt` stay."
 
-Wait for confirmation before deleting anything. Never delete the final `docs/video-to-spec/<spec>/` contents (including a generated `transcript.srt`).
+Only if the user deferred in step 1 (or the answer no longer covers what is actually on disk) ask now, quoting real sizes:
+
+> "Cleanup: `_work/` holds <N> MB of intermediate frames and the source video is <M> MB. Delete them? The referenced frames and `transcript.srt` stay either way."
+
+Never delete the final `docs/video-to-spec/<spec>/` contents (including a generated `transcript.srt`), and never delete a user-supplied captions file unless they said so explicitly.
 
 ## Heuristics and edge cases
 
@@ -258,6 +286,7 @@ Wait for confirmation before deleting anything. Never delete the final `docs/vid
 - **Multiple roles in one recording** (admin then brand then back) – preserve role context in each task; use the "As <role>" field.
 - **Frame matches "(none yet)"** – segments before the first kept frame have no anchor. Note this in the task if relevant; usually means the user spoke before sharing screen.
 - **Non-English audio** – whisper models handle multilingual audio well; keep the tasks in the language the project's docs use, quoting the speaker verbatim in the original language where load-bearing.
+- **Code-switched audio** (the speaker mixes languages mid-sentence) – the weak spot of every model here. Symptoms in the transcript: a phrase transliterated into the wrong alphabet, a switched phrase silently translated instead of quoted, or a run of nonsense words where the switch happened. Treat those cues as unreliable and check the matched frame before turning them into a task; if several are damaged, re-run at `--quality max` **and rebuild the timeline (step 4)** before continuing – see the quality-tier note in step 3. Never force `--language` on this kind of recording.
 - **Vocabulary discipline** – if the project has a glossary or UI-strings file, prefer those terms in task titles and copy.
 
 ## Tone for generated tasks
