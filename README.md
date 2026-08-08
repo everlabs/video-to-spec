@@ -137,3 +137,5 @@ Two things to keep in mind:
 ## Credits
 
 Built by **Oleg Pasko** @ **Everlabs**. One of the [Everlabs public skills](https://github.com/everlabs/public-skills).
+
+Read the story behind it: [**Video to Spec**](https://everlabs.com/blog/video-to-spec) on the Everlabs blog.
