@@ -6,7 +6,7 @@ Usage:
     process_inputs.py <video> <srt> <output-dir> [--threshold N] [--backend B]
 
 Backends (auto-detected, in preference order):
-    pixel         mean absolute pixel difference on 64x64 grayscale
+    pixel         share of pixels that changed, measured on grayscale
                   thumbnails that ffmpeg produces in one extra pass.
                   No dependencies beyond ffmpeg; compares in milliseconds.
     imagemagick   `magick compare -metric PHASH` (ImageMagick 7)
@@ -142,7 +142,7 @@ def extract_frames(video: Path, raw_dir: Path) -> list[Path]:
 
 
 def extract_signatures(video: Path, work_dir: Path) -> list[bytes]:
-    """One extra ffmpeg pass emitting a 64x64 grayscale thumbnail per second.
+    """One extra ffmpeg pass emitting a grayscale thumbnail per second.
 
     Written as a single raw stream so the whole recording costs one subprocess
     and SIG_EDGE**2 bytes per frame, rather than a process per comparison.
