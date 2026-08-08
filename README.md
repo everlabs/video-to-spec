@@ -1,6 +1,6 @@
 # video-to-spec
 
-An [Agent Skill](https://agentskills.io) that turns a screen-recording walkthrough (Loom, QuickTime, anything ffmpeg reads) into a folder of reviewable, self-contained user-story specifications – each task with the exact screenshots the speaker was looking at when they said it.
+An Agent Skill that turns a screen-recording walkthrough (Loom, QuickTime, anything ffmpeg reads) into a folder of reviewable, self-contained user-story specifications – each task with the exact screenshots the speaker was looking at when they said it.
 
 Works with any AI agent that supports the SKILL.md standard: Claude Code, Codex, Cursor, OpenCode, Gemini CLI, and others.
 
