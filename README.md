@@ -11,10 +11,10 @@ Works with any AI agent that supports the SKILL.md standard: Claude Code, Codex,
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <img src="https://raw.githubusercontent.com/everlabs/public-skills/main/assets/video-to-spec-scheme.svg" alt="How the skill works: a screen recording is split into deduplicated frames and a transcript, merged into a timeline, mined for tasks, and written out as a numbered spec folder.">
+      <img src="assets/video-to-spec-scheme.svg" alt="How the skill works: a screen recording is split into deduplicated frames and a transcript, merged into a timeline, mined for tasks, and written out as a numbered spec folder.">
     </td>
     <td width="50%" valign="top">
-      <img src="https://raw.githubusercontent.com/everlabs/public-skills/main/assets/video-to-spec-example.svg" alt="A single spec file produced by the skill: task title, type and source timestamps, user story, the quoted remark it came from, and a wireframe of the screen it refers to.">
+      <img src="assets/video-to-spec-example.svg" alt="A single spec file produced by the skill: task title, type and source timestamps, user story, the quoted remark it came from, and a wireframe of the screen it refers to.">
     </td>
   </tr>
 </table>
@@ -23,7 +23,7 @@ Works with any AI agent that supports the SKILL.md standard: Claude Code, Codex,
 recording.mp4 (+ optional captions)
         │
         ▼
-frames @ 1fps ──► perceptual-hash dedup ──► unique screen states
+frames @ 1fps ──► pixel-diff dedup ──► unique screen states
 transcript    ──► (provided SRT/VTT, or generated via whisper)
         │
         ▼
@@ -52,15 +52,16 @@ The extraction is opinionated about how people actually talk in walkthroughs:
 
 ## Install
 
-Just feed this skill to your AI agent: copy the `video-to-spec` folder into your agent's skills directory.
+This repository *is* the skill, so clone it straight into your agent's skills directory:
 
 ```bash
-git clone <this-repo>
-cp -R public-skills/video-to-spec ~/.claude/skills/    # Claude Code
-cp -R public-skills/video-to-spec ~/.codex/skills/     # Codex
+git clone https://github.com/everlabs/video-to-spec.git ~/.claude/skills/video-to-spec   # Claude Code
+git clone https://github.com/everlabs/video-to-spec.git ~/.codex/skills/video-to-spec    # Codex
 ```
 
-(Cursor, OpenCode, Gemini CLI, etc. – same folder, your agent's skills path. Or simply tell your agent to install it from this repo.)
+Cursor, OpenCode, Gemini CLI, etc. – same command, your agent's skills path. Or simply tell your agent to install it from this repo.
+
+Update later with `git -C ~/.claude/skills/video-to-spec pull`. The virtualenv described below lives in that folder and is git-ignored, so pulling never disturbs it.
 
 Then say things like *"video to spec"*, *"process my loom feedback"*, *"turn this walkthrough into tasks"*, and point your agent at a video.
 
@@ -114,6 +115,25 @@ It is OpenAI's most accurate transcription model, and it cannot be used here. Th
 
 The skill drafts everything first, then asks its clarifying questions as one batch – ambiguities, contradictions, places where it read an implied requirement beyond what was literally said. You answer once, the affected specs get updated, and the folder is ready to hand off.
 
+## Contributing
+
+Issues and pull requests are welcome – this repo holds nothing but the skill, so a change here cannot break anything else.
+
+The moving parts, in the order they run:
+
+| File | Role |
+|---|---|
+| `SKILL.md` | the whole procedure your agent follows – 10 numbered steps, plus the rules for turning speech into tasks |
+| `scripts/process_inputs.py` | frames, dedup, transcript parsing, and the merged `timeline.md` |
+| `scripts/transcribe.py` | provider detection and transcription, only when no captions were supplied |
+
+Both scripts are dependency-free Python 3 (standard library plus ffmpeg on `PATH`), so they run with any `python3` and need no build step. `SKILL.md` is prose, and changes there are best tested by pointing an agent at a real recording and watching where it goes wrong.
+
+Two things to keep in mind:
+
+- **The skill must stay agent-agnostic.** No harness-specific tool names in `SKILL.md` – say "your todo tool", not the name of one particular agent's.
+- **Dedup thresholds are empirical.** If you change `--backend` defaults or the pixel constants, report what you measured them on; screen recordings vary enormously between desktop and portrait mobile capture.
+
 ## Credits
 
-Built by **Oleg Pasko** @ **Everlabs**. Feedback and PRs welcome.
+Built by **Oleg Pasko** @ **Everlabs**. One of the [Everlabs public skills](https://github.com/everlabs/public-skills).

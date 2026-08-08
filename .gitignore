@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+
+# Skill-local virtualenvs. The README documents installing mlx-whisper into
+# `<skill>/.venv`, which is multiple gigabytes and must never be committed.
+.venv/
+venv/
